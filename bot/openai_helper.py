@@ -24,9 +24,9 @@ GPT_3_16K_MODELS = ("gpt-3.5-turbo-16k", "gpt-3.5-turbo-16k-0613", "gpt-3.5-turb
 GPT_4_MODELS = ("gpt-4", "gpt-4-0314", "gpt-4-0613", "gpt-4-turbo-preview")
 GPT_4_32K_MODELS = ("gpt-4-32k", "gpt-4-32k-0314", "gpt-4-32k-0613")
 GPT_4_VISION_MODELS = ("gpt-4o",)
-GPT_4_128K_MODELS = ("gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview", "gpt-4-turbo", "gpt-4-turbo-2024-04-09")
+GPT_4_128K_MODELS = ("gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview", "gpt-4-turbo", "gpt-4-turbo-2024-04-09", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.5", "gpt-4.5-turbo")
 GPT_4O_MODELS = ("gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest")
-O_MODELS = ("o1", "o1-mini", "o1-preview")
+O_MODELS = ("o1", "o1-mini", "o1-preview", "o3", "o3-mini")
 GPT_ALL_MODELS = GPT_3_MODELS + GPT_3_16K_MODELS + GPT_4_MODELS + GPT_4_32K_MODELS + GPT_4_VISION_MODELS + GPT_4_128K_MODELS + GPT_4O_MODELS + O_MODELS
 
 def default_max_tokens(model: str) -> int:
@@ -334,8 +334,6 @@ class OpenAIHelper:
                 prompt=prompt,
                 n=1,
                 model=self.config['image_model'],
-                quality=self.config['image_quality'],
-                style=self.config['image_style'],
                 size=self.config['image_size']
             )
 
@@ -349,6 +347,7 @@ class OpenAIHelper:
             return response.data[0].url, self.config['image_size']
         except Exception as e:
             raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
+
 
     async def generate_speech(self, text: str) -> tuple[any, int]:
         """
@@ -615,54 +614,44 @@ class OpenAIHelper:
             temperature=1 if self.config['model'] in O_MODELS else 0.4
         )
         return response.choices[0].message.content
-
+    
     def __max_model_tokens(self):
         base = 4096
-        if self.config['model'] in GPT_3_MODELS:
+        model = self.config['model']
+        if model in GPT_3_MODELS:
             return base
-        if self.config['model'] in GPT_3_16K_MODELS:
+        if model in GPT_3_16K_MODELS:
             return base * 4
-        if self.config['model'] in GPT_4_MODELS:
+        if model in GPT_4_MODELS:
             return base * 2
-        if self.config['model'] in GPT_4_32K_MODELS:
+        if model in GPT_4_32K_MODELS:   
             return base * 8
-        if self.config['model'] in GPT_4_VISION_MODELS:
+        if model in GPT_4_VISION_MODELS:
             return base * 31
-        if self.config['model'] in GPT_4_128K_MODELS:
+        if model in GPT_4_128K_MODELS:
             return base * 31
-        if self.config['model'] in GPT_4O_MODELS:
+        if model in GPT_4O_MODELS:
             return base * 31
-        elif self.config['model'] in O_MODELS:
-            # https://platform.openai.com/docs/models#o1
-            if self.config['model'] == "o1":
+        if model in O_MODELS:
+            if model == "o1":
                 return 100_000
-            elif self.config['model'] == "o1-preview":
+            elif model == "o1-preview":
                 return 32_768
             else:
                 return 65_536
-        raise NotImplementedError(
-            f"Max tokens for model {self.config['model']} is not implemented yet."
-        )
+        raise NotImplementedError(f"Max tokens for model {model} is not implemented yet.")
 
-    # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
     def __count_tokens(self, messages) -> int:
-        """
-        Counts the number of tokens required to send the given messages.
-        :param messages: the messages to send
-        :return: the number of tokens required
-        """
         model = self.config['model']
         try:
             encoding = tiktoken.encoding_for_model(model)
         except KeyError:
             encoding = tiktoken.get_encoding("o200k_base")
 
-        if model in GPT_ALL_MODELS:
-            tokens_per_message = 3
-            tokens_per_name = 1
-        else:
-            raise NotImplementedError(f"""num_tokens_from_messages() is not implemented for model {model}.""")
+        tokens_per_message = 3
+        tokens_per_name = 1
         num_tokens = 0
+
         for message in messages:
             num_tokens += tokens_per_message
             for key, value in message.items():
@@ -680,60 +669,31 @@ class OpenAIHelper:
                     num_tokens += len(encoding.encode(value))
                     if key == "name":
                         num_tokens += tokens_per_name
-        num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
+        num_tokens += 3
         return num_tokens
 
-    # no longer needed
-
     def __count_tokens_vision(self, image_bytes: bytes) -> int:
-        """
-        Counts the number of tokens for interpreting an image.
-        :param image_bytes: image to interpret
-        :return: the number of tokens required
-        """
+        import io
+        from PIL import Image
+
         image_file = io.BytesIO(image_bytes)
         image = Image.open(image_file)
         model = self.config['vision_model']
         if model not in GPT_4_VISION_MODELS:
             raise NotImplementedError(f"""count_tokens_vision() is not implemented for model {model}.""")
-        
+
         w, h = image.size
         if w > h: w, h = h, w
-        # this computation follows https://platform.openai.com/docs/guides/vision and https://openai.com/pricing#gpt-4-turbo
         base_tokens = 85
         detail = self.config['vision_detail']
         if detail == 'low':
             return base_tokens
-        elif detail == 'high' or detail == 'auto': # assuming worst cost for auto
+        elif detail in ['high', 'auto']:
             f = max(w / 768, h / 2048)
             if f > 1:
                 w, h = int(w / f), int(h / f)
             tw, th = (w + 511) // 512, (h + 511) // 512
             tiles = tw * th
-            num_tokens = base_tokens + tiles * 170
-            return num_tokens
+            return base_tokens + tiles * 170
         else:
-            raise NotImplementedError(f"""unknown parameter detail={detail} for model {model}.""")
-
-    # No longer works as of July 21st 2023, as OpenAI has removed the billing API
-    # def get_billing_current_month(self):
-    #     """Gets billed usage for current month from OpenAI API.
-    #
-    #     :return: dollar amount of usage this month
-    #     """
-    #     headers = {
-    #         "Authorization": f"Bearer {openai.api_key}"
-    #     }
-    #     # calculate first and last day of current month
-    #     today = date.today()
-    #     first_day = date(today.year, today.month, 1)
-    #     _, last_day_of_month = monthrange(today.year, today.month)
-    #     last_day = date(today.year, today.month, last_day_of_month)
-    #     params = {
-    #         "start_date": first_day,
-    #         "end_date": last_day
-    #     }
-    #     response = requests.get("https://api.openai.com/dashboard/billing/usage", headers=headers, params=params)
-    #     billing_data = json.loads(response.text)
-    #     usage_month = billing_data["total_usage"] / 100  # convert cent amount to dollars
-    #     return usage_month
+            raise NotImplementedError(f"unknown parameter detail={detail} for model {model}.")
