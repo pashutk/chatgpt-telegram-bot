@@ -27,7 +27,9 @@ GPT_4_VISION_MODELS = ("gpt-4o",)
 GPT_4_128K_MODELS = ("gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview", "gpt-4-turbo", "gpt-4-turbo-2024-04-09", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.5", "gpt-4.5-turbo")
 GPT_4O_MODELS = ("gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest")
 O_MODELS = ("o1", "o1-mini", "o1-preview", "o3", "o3-mini")
-GPT_ALL_MODELS = GPT_3_MODELS + GPT_3_16K_MODELS + GPT_4_MODELS + GPT_4_32K_MODELS + GPT_4_VISION_MODELS + GPT_4_128K_MODELS + GPT_4O_MODELS + O_MODELS
+GPT_5_MODELS = ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-2025-08-07", "gpt-5-chat-latest", "gpt-5-pro", "gpt-5.1", "gpt-5.1-chat-latest")
+GPT_5_CODEX_MODELS = ("gpt-5-codex", "gpt-5.1-codex", "gpt-5.1-codex-mini")
+GPT_ALL_MODELS = GPT_3_MODELS + GPT_3_16K_MODELS + GPT_4_MODELS + GPT_4_32K_MODELS + GPT_4_VISION_MODELS + GPT_4_128K_MODELS + GPT_4O_MODELS + O_MODELS + GPT_5_MODELS + GPT_5_CODEX_MODELS
 
 def default_max_tokens(model: str) -> int:
     """
@@ -54,6 +56,8 @@ def default_max_tokens(model: str) -> int:
         return 4096
     elif model in O_MODELS:
         return 4096
+    elif model in GPT_5_MODELS or model in GPT_5_CODEX_MODELS:
+        return 8192
 
 
 def are_functions_available(model: str) -> bool:
@@ -624,7 +628,7 @@ class OpenAIHelper:
             return base * 4
         if model in GPT_4_MODELS:
             return base * 2
-        if model in GPT_4_32K_MODELS:   
+        if model in GPT_4_32K_MODELS:
             return base * 8
         if model in GPT_4_VISION_MODELS:
             return base * 31
@@ -639,6 +643,8 @@ class OpenAIHelper:
                 return 32_768
             else:
                 return 65_536
+        if model in GPT_5_MODELS or model in GPT_5_CODEX_MODELS:
+            return 200_000  # GPT-5 models support 200k context window
         raise NotImplementedError(f"Max tokens for model {model} is not implemented yet.")
 
     def __count_tokens(self, messages) -> int:
