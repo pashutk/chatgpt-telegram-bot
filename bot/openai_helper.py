@@ -27,8 +27,8 @@ GPT_4_VISION_MODELS = ("gpt-4o",)
 GPT_4_128K_MODELS = ("gpt-4-1106-preview", "gpt-4-0125-preview", "gpt-4-turbo-preview", "gpt-4-turbo", "gpt-4-turbo-2024-04-09", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4.5", "gpt-4.5-turbo")
 GPT_4O_MODELS = ("gpt-4o", "gpt-4o-mini", "chatgpt-4o-latest")
 O_MODELS = ("o1", "o1-mini", "o1-preview", "o3", "o3-mini")
-GPT_5_MODELS = ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-2025-08-07", "gpt-5-chat-latest", "gpt-5-pro", "gpt-5.1", "gpt-5.1-chat-latest")
-GPT_5_CODEX_MODELS = ("gpt-5-codex", "gpt-5.1-codex", "gpt-5.1-codex-mini")
+GPT_5_MODELS = ("gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-2025-08-07", "gpt-5-chat-latest", "gpt-5-pro", "gpt-5.1", "gpt-5.1-chat-latest", "gpt-5.2", "gpt-5.2-pro", "gpt-5.2-chat-latest")
+GPT_5_CODEX_MODELS = ("gpt-5-codex", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max")
 GPT_ALL_MODELS = GPT_3_MODELS + GPT_3_16K_MODELS + GPT_4_MODELS + GPT_4_32K_MODELS + GPT_4_VISION_MODELS + GPT_4_128K_MODELS + GPT_4O_MODELS + O_MODELS + GPT_5_MODELS + GPT_5_CODEX_MODELS
 
 def default_max_tokens(model: str) -> int:
@@ -58,6 +58,7 @@ def default_max_tokens(model: str) -> int:
         return 4096
     elif model in GPT_5_MODELS or model in GPT_5_CODEX_MODELS:
         return 8192
+    return 1200  # Default fallback for unknown models
 
 
 def are_functions_available(model: str) -> bool:
@@ -95,6 +96,23 @@ def localized_text(key, bot_language):
             # return key as text
             return key
 
+
+
+class Delta:
+    def __init__(self, role=None, content=None, type=None, function_call=None):
+        self.role = role
+        self.content = content
+        self.function_call = function_call
+        self.type = type
+
+class StreamChoice:
+    def __init__(self, delta, finish_reason=None):
+        self.delta = delta
+        self.finish_reason = finish_reason
+
+class StreamChunk:
+    def __init__(self, choices):
+        self.choices = choices
 
 class OpenAIHelper:
     """
@@ -188,6 +206,15 @@ class OpenAIHelper:
             if len(chunk.choices) == 0:
                 continue
             delta = chunk.choices[0].delta
+            # Check for reasoning status
+            if getattr(delta, 'type', None) == 'reasoning':
+                yield "🤔 Thinking...", 'not_finished'
+                continue
+            
+            if getattr(delta, 'type', None) == 'tool_status':
+                yield delta.content, 'not_finished'
+                continue
+
             if delta.content:
                 answer += delta.content
                 yield answer, 'not_finished'
@@ -257,10 +284,14 @@ class OpenAIHelper:
                 'stream': stream
             }
 
+            if self.config['model'] in GPT_5_MODELS or self.config['model'] in GPT_5_CODEX_MODELS:
+                return await self._generate_gpt5_response(chat_id, stream=stream)
+
+            # Legacy Chat Completion API for other models
             if self.config['enable_functions'] and not self.conversations_vision[chat_id]:
                 functions = self.plugin_manager.get_functions_specs()
                 if len(functions) > 0:
-                    common_args['functions'] = self.plugin_manager.get_functions_specs()
+                    common_args['functions'] = functions
                     common_args['function_call'] = 'auto'
             return await self.client.chat.completions.create(**common_args)
 
@@ -274,37 +305,137 @@ class OpenAIHelper:
             raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
 
     async def __handle_function_call(self, chat_id, response, stream=False, times=0, plugins_used=()):
+        if stream:
+            async def stream_middleware():
+                function_name = ''
+                arguments = ''
+                is_collecting_function = False
+                
+                async for chunk in response:
+                    if len(chunk.choices) == 0:
+                        continue
+                    
+                    delta = chunk.choices[0].delta
+                    
+                    # Pass through reasoning and tool_status
+                    if getattr(delta, 'type', None) in ['reasoning', 'tool_status']:
+                        yield chunk
+                        continue
+
+                    # Check for function call
+                    if delta.function_call:
+                        is_collecting_function = True
+                        if delta.function_call.name:
+                            function_name += delta.function_call.name
+                        if delta.function_call.arguments:
+                            arguments += delta.function_call.arguments
+                        continue # Don't yield function call bits to the consumer
+
+                    # Pass through content
+                    if delta.content:
+                        yield chunk
+                
+                # Stream finished, check if we captured a function call
+                if is_collecting_function:
+                    logging.info(f'Calling function {function_name} with arguments {arguments}')
+                    
+                    # Yield status
+                    yield StreamChunk([StreamChoice(Delta(type='tool_status', content=f"🔎 Using {function_name}..."))])
+                    
+                    # Execute
+                    function_response = await self.plugin_manager.call_function(function_name, self, arguments)
+
+                    # Handle execution result
+                    if is_direct_result(function_response):
+                        self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name,
+                                                            content=json.dumps({'result': 'Done, the content has been sent'
+                                                                                          'to the user.'}))
+                        return
+
+                    self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name, content=function_response)
+                    
+                    # Recursive call
+                    new_plugins_used = plugins_used + (function_name,)
+                    if self.config['model'] in GPT_5_MODELS or self.config['model'] in GPT_5_CODEX_MODELS:
+                        next_response_stream = await self._generate_gpt5_response(
+                            chat_id, 
+                            stream=True, 
+                            allow_functions=(times < self.config['functions_max_consecutive_calls'])
+                        )
+                    else:
+                        next_response_stream = await self.client.chat.completions.create(
+                            model=self.config['model'],
+                            messages=self.conversations[chat_id],
+                            functions=self.plugin_manager.get_functions_specs(),
+                            function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
+                            stream=True
+                        )
+                    
+                    # Wrap the next stream recursively
+                    next_wrapper, _ = await self.__handle_function_call(chat_id, next_response_stream, stream=True, times=times+1, plugins_used=new_plugins_used)
+                    async for item in next_wrapper:
+                        yield item
+
+            return stream_middleware(), plugins_used
+
+        # Non-streaming logic (Legacy/Blocking)
         function_name = ''
         arguments = ''
-        if stream:
-            async for item in response:
-                if len(item.choices) > 0:
-                    first_choice = item.choices[0]
-                    if first_choice.delta and first_choice.delta.function_call:
-                        if first_choice.delta.function_call.name:
-                            function_name += first_choice.delta.function_call.name
-                        if first_choice.delta.function_call.arguments:
-                            arguments += first_choice.delta.function_call.arguments
-                    elif first_choice.finish_reason and first_choice.finish_reason == 'function_call':
-                        break
-                    else:
-                        return response, plugins_used
-                else:
-                    return response, plugins_used
-        else:
-            if len(response.choices) > 0:
-                first_choice = response.choices[0]
-                if first_choice.message.function_call:
-                    if first_choice.message.function_call.name:
-                        function_name += first_choice.message.function_call.name
-                    if first_choice.message.function_call.arguments:
-                        arguments += first_choice.message.function_call.arguments
-                else:
-                    return response, plugins_used
+        if len(response.choices) > 0:
+            first_choice = response.choices[0]
+            if first_choice.message.function_call:
+                if first_choice.message.function_call.name:
+                    function_name += first_choice.message.function_call.name
+                if first_choice.message.function_call.arguments:
+                    arguments += first_choice.message.function_call.arguments
             else:
                 return response, plugins_used
+        else:
+            return response, plugins_used
 
         logging.info(f'Calling function {function_name} with arguments {arguments}')
+
+        if stream:
+            async def chained():
+                # Yield status immediately
+                yield StreamChunk([StreamChoice(Delta(type='tool_status', content=f"🔎 Using {function_name}..."))])
+                
+                # Execute function
+                function_response = await self.plugin_manager.call_function(function_name, self, arguments)
+
+                # Add to history
+                if is_direct_result(function_response):
+                    self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name,
+                                                        content=json.dumps({'result': 'Done, the content has been sent'
+                                                                                      'to the user.'}))
+                    return 
+
+                self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name, content=function_response)
+                
+                # Call next model turn
+                if self.config['model'] in GPT_5_MODELS or self.config['model'] in GPT_5_CODEX_MODELS:
+                    response = await self._generate_gpt5_response(
+                         chat_id, 
+                         stream=True, 
+                         allow_functions=(times < self.config['functions_max_consecutive_calls'])
+                    )
+                else:
+                    response = await self.client.chat.completions.create(
+                        model=self.config['model'],
+                        messages=self.conversations[chat_id],
+                        functions=self.plugin_manager.get_functions_specs(),
+                        function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
+                        stream=True
+                    )
+                
+                # Recursive call
+                next_response_tuple = await self.__handle_function_call(chat_id, response, stream=True, times=times + 1, plugins_used=plugins_used + (function_name,))
+                async for item in next_response_tuple[0]:
+                    yield item
+
+            return chained(), plugins_used + (function_name,)
+
+        # Non-streaming logic
         function_response = await self.plugin_manager.call_function(function_name, self, arguments)
 
         if function_name not in plugins_used:
@@ -317,13 +448,20 @@ class OpenAIHelper:
             return function_response, plugins_used
 
         self.__add_function_call_to_history(chat_id=chat_id, function_name=function_name, content=function_response)
-        response = await self.client.chat.completions.create(
-            model=self.config['model'],
-            messages=self.conversations[chat_id],
-            functions=self.plugin_manager.get_functions_specs(),
-            function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
-            stream=stream
-        )
+        if self.config['model'] in GPT_5_MODELS or self.config['model'] in GPT_5_CODEX_MODELS:
+            response = await self._generate_gpt5_response(
+                 chat_id, 
+                 stream=stream, 
+                 allow_functions=(times < self.config['functions_max_consecutive_calls'])
+            )
+        else:
+            response = await self.client.chat.completions.create(
+                model=self.config['model'],
+                messages=self.conversations[chat_id],
+                functions=self.plugin_manager.get_functions_specs(),
+                function_call='auto' if times < self.config['functions_max_consecutive_calls'] else 'none',
+                stream=stream
+            )
         return await self.__handle_function_call(chat_id, response, stream, times + 1, plugins_used)
 
     async def generate_image(self, prompt: str) -> tuple[str, str]:
@@ -571,7 +709,14 @@ class OpenAIHelper:
         """
         if content == '':
             content = self.config['assistant_prompt']
-        self.conversations[chat_id] = [{"role": "assistant" if self.config['model'] in O_MODELS else "system", "content": content}]
+        # Determine the appropriate role for system prompt
+        if self.config['model'] in O_MODELS:
+            role = "assistant"
+        elif self.config['model'] in GPT_5_MODELS or self.config['model'] in GPT_5_CODEX_MODELS:
+            role = "developer"
+        else:
+            role = "system"
+        self.conversations[chat_id] = [{"role": role, "content": content}]
         self.conversations_vision[chat_id] = False
 
     def __max_age_reached(self, chat_id) -> bool:
@@ -586,6 +731,169 @@ class OpenAIHelper:
         now = datetime.datetime.now()
         max_age_minutes = self.config['max_conversation_age_minutes']
         return last_updated < now - datetime.timedelta(minutes=max_age_minutes)
+
+    async def _generate_gpt5_response(self, chat_id, stream=False, allow_functions=True):
+        """
+        Refactored implementation using the client.responses.create API for GPT-5 models.
+        Adapts Responses API events to the ChatCompletionChunk format expected by consumers.
+        """
+        # Prepare Input Items from Conversation History
+        input_items = []
+        for msg in self.conversations[chat_id]:
+            role = msg['role']
+            content = msg['content']
+            
+            if role == 'function':
+                # Map legacy 'function' role to 'function_call_output' item
+                # Generate a consistent (fake) call_id since legacy history lacks it
+                call_id = f"call_{msg.get('name', 'unknown')}"
+                input_items.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": str(content)
+                })
+            elif role in ['user', 'system', 'developer', 'assistant']:
+                # Map 'system' to 'developer' for GPT-5 Responses API
+                if role == 'system':
+                    role = 'developer'
+                # Pass as standard message item
+                input_items.append({
+                    "type": "message",
+                    "role": role,
+                    "content": content
+                })
+            # Ignore unknown roles
+
+        # Prepare Tools and Include Parameters
+        tools_arg = []
+        include_arg = []
+        
+        # Native Features
+        if self.config.get('enable_web_search'):
+            tools_arg.append({"type": "web_search"})
+            include_arg.append("web_search_call.action.sources")
+            
+        if self.config.get('enable_file_search'):
+            v_id = self.config.get('file_search_vector_store_ids')
+            if v_id:
+                tools_arg.append({"type": "file_search", "file_search": {"vector_store_ids": v_id.split(',')}})
+                include_arg.append("file_search_call.results")
+
+        if self.config.get('enable_code_interpreter'):
+             tools_arg.append({"type": "code_interpreter"})
+             include_arg.append("code_interpreter_call.outputs")
+
+        if self.config.get('enable_mcp') and self.config.get('mcp_server_url'):
+            tools_arg.append({
+                "type": "mcp",
+                "server_label": self.config.get('mcp_server_label', 'default_mcp'),
+                "server_url": self.config.get('mcp_server_url'),
+                "require_approval": "never"
+            })
+
+        # Custom Functions
+        if self.config.get('enable_functions') and allow_functions:
+            functions = self.plugin_manager.get_functions_specs()
+            for func in functions:
+                tools_arg.append({"type": "function", "function": func})
+
+        # Request Parameters
+        params = {
+            "model": self.config['model'],
+            "input": input_items,
+            "stream": True, # Always stream to handle events
+        }
+        
+        if tools_arg:
+            params['tools'] = tools_arg
+            # Add tool_choice to control when tools are used
+            tool_choice = self.config.get('tool_choice', 'auto')
+            if tool_choice in ['auto', 'required', 'none']:
+                params['tool_choice'] = tool_choice
+        if include_arg:
+            params['include'] = include_arg
+        if self.config['reasoning_effort'] != 'none':
+             params['reasoning'] = {'effort': self.config['reasoning_effort']}
+        if self.config.get('verbosity'):
+             params['text'] = {'verbosity': self.config['verbosity']}
+
+        # Perform API Call
+        try:
+            response_stream = await self.client.responses.create(**params)
+        except Exception as e:
+            logging.error(f"GPT-5 API Error: {e}")
+            bot_language = self.config['bot_language']
+            raise Exception(f"⚠️ _{localized_text('error', bot_language)}._ ⚠️\n{str(e)}") from e
+
+        # Stream Adapter
+        async def response_adapter():
+            # Initial chunk to satisfy consumers waiting for a role
+            yield StreamChunk([StreamChoice(Delta(role='assistant', content=''))])
+            
+            reasoning_started = False
+            async for event in response_stream:
+                if event.type == 'response.output_text.delta':
+                    yield StreamChunk([StreamChoice(Delta(content=event.delta))])
+                
+                elif event.type == 'response.reasoning_text.delta':
+                     yield StreamChunk([StreamChoice(Delta(type='reasoning'))])
+
+                elif event.type == 'response.in_progress' and not reasoning_started:
+                     reasoning_started = True
+                     yield StreamChunk([StreamChoice(Delta(type='reasoning'))])
+
+                elif event.type == 'response.output_item.added':
+                     pass
+
+                elif event.type == 'response.function_call_arguments.delta':
+                     # Function call details streaming
+                     fc_stub = type('FunctionCallStub', (object,), {'name': None, 'arguments': event.delta})
+                     yield StreamChunk([StreamChoice(Delta(function_call=fc_stub))])
+                
+                elif event.type == 'response.function_call.delta':
+                     # Newer event type for some tools
+                     fc_stub = type('FunctionCallStub', (object,), {
+                         'name': getattr(event, 'function_name', None), 
+                         'arguments': getattr(event, 'function_arguments', None)
+                     })
+                     yield StreamChunk([StreamChoice(Delta(function_call=fc_stub))])
+
+                elif event.type == 'response.output_text.done':
+                    pass
+
+                # Handle Tool Status Events (Visual Feedback)
+                elif 'searching' in event.type or 'in_progress' in event.type:
+                     status_msg = ""
+                     if 'web_search' in event.type: status_msg = "🔎 Searching the web..."
+                     elif 'file_search' in event.type: status_msg = "📂 Searching files..."
+                     elif 'code_interpreter' in event.type: status_msg = "🐍 Running code..."
+                     elif 'computer' in event.type: status_msg = "💻 Using computer..."
+                     elif 'function_call' in event.type: pass 
+                     
+                     if status_msg:
+                         yield StreamChunk([StreamChoice(Delta(type='tool_status', content=status_msg))])
+
+        if stream:
+            return response_adapter()
+        else:
+            # Aggregate if non-stream requested (legacy support)
+            full_content = ""
+            async for chunk in response_adapter():
+                d = chunk.choices[0].delta
+                if d.content:
+                    full_content += d.content
+            
+            # Construct mock object with usage tracking
+            class MockResponse:
+                def __init__(self, content):
+                    self.choices = [type('Choice', (object,), {'message': type('Message', (object,), {'content': content, 'function_call': None, 'tool_calls': None})()})]
+                    # Estimate token usage since Responses API doesn't provide it in same format
+                    self.usage = type('Usage', (object,), {
+                        'total_tokens': 0,
+                        'prompt_tokens': 0,
+                        'completion_tokens': 0
+                    })()
+            return MockResponse(full_content)
 
     def __add_function_call_to_history(self, chat_id, function_name, content):
         """
@@ -608,16 +916,37 @@ class OpenAIHelper:
         :param conversation: The conversation history
         :return: The summary
         """
-        messages = [
-            {"role": "assistant", "content": "Summarize this conversation in 700 characters or less"},
-            {"role": "user", "content": str(conversation)}
-        ]
-        response = await self.client.chat.completions.create(
-            model=self.config['model'],
-            messages=messages,
-            temperature=1 if self.config['model'] in O_MODELS else 0.4
-        )
-        return response.choices[0].message.content
+        if self.config['model'] in GPT_5_MODELS or self.config['model'] in GPT_5_CODEX_MODELS:
+            # Use Responses API for GPT-5 models
+            input_items = [
+                {"type": "message", "role": "developer", "content": "Summarize this conversation in 700 characters or less"},
+                {"type": "message", "role": "user", "content": str(conversation)}
+            ]
+            response = await self.client.responses.create(
+                model=self.config['model'],
+                input=input_items
+            )
+            # Extract text from response output
+            if hasattr(response, 'output_text'):
+                return response.output_text
+            # Fallback: iterate through output items
+            for item in response.output:
+                if hasattr(item, 'content'):
+                    for content_block in item.content:
+                        if hasattr(content_block, 'text'):
+                            return content_block.text
+            return str(response.output)
+        else:
+            messages = [
+                {"role": "assistant", "content": "Summarize this conversation in 700 characters or less"},
+                {"role": "user", "content": str(conversation)}
+            ]
+            response = await self.client.chat.completions.create(
+                model=self.config['model'],
+                messages=messages,
+                temperature=1 if self.config['model'] in O_MODELS else 0.4
+            )
+            return response.choices[0].message.content
     
     def __max_model_tokens(self):
         base = 4096
@@ -644,6 +973,8 @@ class OpenAIHelper:
             else:
                 return 65_536
         if model in GPT_5_MODELS or model in GPT_5_CODEX_MODELS:
+            if "gpt-5.2" in model or "gpt-5.1-codex-max" in model:
+                return 400_000
             return 200_000  # GPT-5 models support 200k context window
         raise NotImplementedError(f"Max tokens for model {model} is not implemented yet.")
 
@@ -651,8 +982,11 @@ class OpenAIHelper:
         model = self.config['model']
         try:
             encoding = tiktoken.encoding_for_model(model)
-        except KeyError:
-            encoding = tiktoken.get_encoding("o200k_base")
+        except (KeyError, ValueError):
+            try:
+                encoding = tiktoken.get_encoding("o200k_base")
+            except ValueError:
+                encoding = tiktoken.get_encoding("cl100k_base")
 
         tokens_per_message = 3
         tokens_per_name = 1
@@ -686,7 +1020,11 @@ class OpenAIHelper:
         image = Image.open(image_file)
         model = self.config['vision_model']
         if model not in GPT_4_VISION_MODELS:
-            raise NotImplementedError(f"""count_tokens_vision() is not implemented for model {model}.""")
+            if model in GPT_5_MODELS or model in GPT_5_CODEX_MODELS or model in GPT_4O_MODELS:
+                # Use same estimation formula for GPT-5 and GPT-4o models
+                pass  # Continue with the calculation below
+            else:
+                raise NotImplementedError(f"""count_tokens_vision() is not implemented for model {model}.""")
 
         w, h = image.size
         if w > h: w, h = h, w
@@ -703,3 +1041,5 @@ class OpenAIHelper:
             return base_tokens + tiles * 170
         else:
             raise NotImplementedError(f"unknown parameter detail={detail} for model {model}.")
+
+
