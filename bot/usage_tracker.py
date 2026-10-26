@@ -120,7 +120,8 @@ class UsageTracker:
                              defaults to [0.016, 0.018, 0.02]
         """
         sizes = ["256x256", "512x512", "1024x1024"]
-        requested_size = sizes.index(image_size)
+        # newer image models use other sizes (e.g. 1536x1024), count them at the largest size price
+        requested_size = sizes.index(image_size) if image_size in sizes else len(sizes) - 1
         image_cost = image_prices[requested_size]
         today = date.today()
         self.add_current_costs(image_cost)

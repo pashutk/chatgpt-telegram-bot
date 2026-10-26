@@ -34,7 +34,8 @@ class WolframAlphaPlugin(Plugin):
 
     async def execute(self, function_name, helper, **kwargs) -> Dict:
         client = wolframalpha.Client(self.app_id)
-        res = client.query(kwargs['query'])
+        # client.query() calls asyncio.run() internally, which fails inside the bot's event loop
+        res = await client.aquery(kwargs['query'])
         try:
             assumption = next(res.pods).text
             answer = next(res.results).text

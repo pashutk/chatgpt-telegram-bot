@@ -678,6 +678,18 @@ class ChatGPTTelegramBot:
                     logging.warning('Message does not start with trigger keyword, ignoring...')
                     return
 
+        progress_message = None
+
+        async def on_function_call(function_name):
+            # tell the user about slow plugins (e.g. drawing an image) instead of a silent pause
+            nonlocal progress_message
+            key = self.openai.plugin_manager.get_progress_message_key(function_name)
+            if key and progress_message is None:
+                progress_message = await update.effective_message.reply_text(
+                    message_thread_id=get_thread_id(update),
+                    text=localized_text(key, self.config['bot_language'])
+                )
+
         try:
             total_tokens = 0
 
@@ -687,7 +699,8 @@ class ChatGPTTelegramBot:
                     message_thread_id=get_thread_id(update)
                 )
 
-                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt)
+                stream_response = self.openai.get_chat_response_stream(chat_id=chat_id, query=prompt,
+                                                                       on_function_call=on_function_call)
                 i = 0
                 prev = ''
                 sent_message = None
@@ -767,7 +780,8 @@ class ChatGPTTelegramBot:
             else:
                 async def _reply():
                     nonlocal total_tokens
-                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt)
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=prompt,
+                                                                                 on_function_call=on_function_call)
 
                     if is_direct_result(response):
                         return await handle_direct_result(self.config, update, response)
@@ -807,6 +821,13 @@ class ChatGPTTelegramBot:
                 text=f"{localized_text('chat_fail', self.config['bot_language'])} {str(e)}",
                 parse_mode=constants.ParseMode.MARKDOWN
             )
+
+        finally:
+            if progress_message is not None:
+                try:
+                    await progress_message.delete()
+                except Exception:
+                    pass
 
     async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import abstractmethod, ABC
 from typing import Dict
 
@@ -21,6 +23,12 @@ class Plugin(ABC):
         https://platform.openai.com/docs/api-reference/chat/create#chat/create-functions
         """
         pass
+
+    def get_progress_message_key(self, function_name) -> str | None:
+        """
+        Key in translations.json of a message shown to the user while the function runs, or None
+        """
+        return None
 
     @abstractmethod
     async def execute(self, function_name, helper, **kwargs) -> Dict:
